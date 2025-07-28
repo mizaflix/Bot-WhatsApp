@@ -1,153 +1,129 @@
-from flask import Flask, request
+from flask import Flask, request, send_from_directory
 from twilio.twiml.messaging_response import MessagingResponse
-import sqlite3
 from reportlab.pdfgen import canvas
 import os
-import smtplib
-from email.message import EmailMessage
-from dotenv import load_dotenv
-
-load_dotenv()
+from datetime import datetime
 
 app = Flask(__name__)
-session_data = {}
+# Pasta onde os contratos serão salvos
+CONTRACT_FOLDER = 'contratos'
+os.makedirs(CONTRACT_FOLDER, exist_ok=True)
 
-# == CONFIGURAÇÕES (Preencha aqui) ==
-EMAIL_REMETENTE = "SEU_EMAIL_AQUI@gmail.com"
-SENHA_EMAIL = "SUA_SENHA_APP"
-ADVOGADO_NOME = "Dr. NOME DO ADVOGADO"
-ADVOGADO_CONTATO = "(xx) xxxxx-xxxx"
+# Dicionário para armazenar o estado de cada usuário
+users = {}
 
-@app.route("/bot", methods=["POST"])
+# Opções por área
+areas = {
+    "Trabalhista": ["Demissão sem justa causa", "Horas extras não pagas", "Assédio moral", "Verbas rescisórias não pagas", "Trabalho sem registro", "Férias não concedidas"],
+    "Previdenciária": ["Aposentadoria por idade", "Auxílio-doença", "Pensão por morte", "Revisão de aposentadoria", "BPC/LOAS", "Aposentadoria por invalidez"],
+    "Cível": ["Cobrança indevida", "Danos morais", "Contrato não cumprido", "Nome negativado indevidamente", "Problemas com aluguel", "Acidente de trânsito"],
+    "Família": ["Pensão alimentícia", "Guarda de filhos", "Divórcio"]
+}
+
+# Espaços personalizáveis
+ADVOGADO_NOME = "[NOME DO ADVOGADO AQUI]"
+ADVOGADO_NUMERO = "[NUMERO DO ADVOGADO AQUI]"
+
+@app.route('/contratos/<filename>')
+def contrato(filename):
+    return send_from_directory(CONTRACT_FOLDER, filename)
+
+@app.route('/', methods=['POST'])
 def bot():
-    incoming_msg = request.values.get('Body', '').strip().lower()
-    from_number = request.values.get('From', '').split(':')[-1]
-    response = MessagingResponse()
-    msg = response.message()
+    sender = request.form['From']
+    msg = request.form['Body'].strip()
+    resp = MessagingResponse()
+    user = users.get(sender, {'step': 0})
 
-    user = session_data.get(from_number, {"step": "inicio"})
+    step = user['step']
 
-    def reset():
-        session_data[from_number] = {"step": "inicio"}
-        return "👋 Olá! Bem-vindo ao atendimento jurídico. Por favor, escolha uma área:\n1️⃣ Trabalhista\n2️⃣ Previdenciária\n3️⃣ Cível"
+    if msg.lower() in ["início", "recomeçar"]:
+        users[sender] = {'step': 0}
+        resp.message("✅ Conversa reiniciada. Digite qualquer coisa para começar.")
+        return str(resp)
 
-    if incoming_msg in ['voltar', 'reiniciar']:
-        msg.body(reset())
-        return str(response)
+    if step == 0:
+        user['step'] = 1
+        users[sender] = user
+        area_list = "\n".join([f"- {a}" for a in areas])
+        resp.message(f"Olá! Qual a área jurídica do seu interesse?\n{area_list}\n\nDigite exatamente como está.")
 
-    # Início
-    if user["step"] == "inicio" or incoming_msg == "oi":
-        user["step"] = "area"
-        msg.body(reset())
-    
-    # Área de interesse
-    elif user["step"] == "area":
-        areas = {"1": "Trabalhista", "2": "Previdenciária", "3": "Cível"}
-        if incoming_msg in areas:
-            user["area"] = areas[incoming_msg]
-            user["step"] = "descricao"
-            msg.body(f"📝 Ótimo! Sobre o que exatamente se trata seu caso na área {areas[incoming_msg]}?")
+    elif step == 1:
+        if msg in areas:
+            user['area'] = msg
+            user['step'] = 2
+            user['opcoes_descricao'] = areas[msg]
+            users[sender] = user
+            texto = "\n".join([f"{i+1}️⃣ {op}" for i, op in enumerate(areas[msg])])
+            resp.message(f"Entendi! Sobre o que se trata especificamente?\n{texto}\n\nResponda com o número da opção.")
         else:
-            msg.body("Escolha uma opção válida:\n1️⃣ Trabalhista\n2️⃣ Previdenciária\n3️⃣ Cível")
+            resp.message("Área inválida. Por favor, digite uma das opções corretamente.")
 
-    elif user["step"] == "descricao":
-        user["descricao"] = incoming_msg
-        user["step"] = "comprovacao"
-        msg.body("📎 Você tem como comprovar o ocorrido? (sim/não)")
+    elif step == 2:
+        try:
+            idx = int(msg) - 1
+            if 0 <= idx < len(user['opcoes_descricao']):
+                user['caso'] = user['opcoes_descricao'][idx]
+                user['step'] = 3
+                users[sender] = user
+                resp.message("Você tem como comprovar isso? (Sim ou Não)")
+            else:
+                raise ValueError
+        except:
+            resp.message("Opção inválida. Responda com o número da opção desejada.")
 
-    elif user["step"] == "comprovacao":
-        if incoming_msg in ["sim", "não", "nao"]:
-            user["tem_comprovacao"] = incoming_msg
-            user["step"] = "como_comprova"
-            msg.body("🔍 Por meio de quê você pode comprovar? (ex: prints, testemunhas, documentos?)")
+    elif step == 3:
+        if msg.lower() in ["sim", "não"]:
+            user['tem_comprovante'] = msg
+            user['step'] = 4
+            users[sender] = user
+            resp.message("Por meio de quê você pode comprovar? (ex: holerite, testemunha, laudo médico...)")
         else:
-            msg.body("Responda apenas com 'sim' ou 'não'.")
+            resp.message("Responda apenas com 'Sim' ou 'Não'.")
 
-    elif user["step"] == "como_comprova":
-        user["como_comprova"] = incoming_msg
-        user["step"] = "veridico"
-        msg.body("✅ As informações que você está fornecendo são verdadeiras e podem ser usadas legalmente? (sim/não)")
+    elif step == 4:
+        user['meio'] = msg
+        user['step'] = 5
+        users[sender] = user
+        resp.message("Tudo isso é verídico? (Sim ou Não)")
 
-    elif user["step"] == "veridico":
-        if incoming_msg in ["sim", "não", "nao"]:
-            user["veridico"] = incoming_msg
-            user["step"] = "email"
-            msg.body("📧 Digite seu e-mail para enviarmos o contrato:")
+    elif step == 5:
+        if msg.lower() in ["sim", "não"]:
+            user['veracidade'] = msg
+            user['step'] = 6
+            users[sender] = user
+            resp.message("Baseado em seu caso, você tem direito a valores entre R$5.000 a R$25.000. Deseja prosseguir com a geração do contrato? (Sim ou Não)")
         else:
-            msg.body("Responda apenas com 'sim' ou 'não'.")
+            resp.message("Responda com 'Sim' ou 'Não'.")
 
-    elif user["step"] == "email":
-        user["email"] = incoming_msg
-        user["step"] = "confirmacao"
-        msg.body(f"📄 Tudo pronto! Deseja gerar o contrato com os dados informados? (sim/não)")
+    elif step == 6:
+        if msg.lower() == "sim":
+            filename = f"contrato-{datetime.now().strftime('%Y%m%d%H%M%S')}.pdf"
+            filepath = os.path.join(CONTRACT_FOLDER, filename)
+            c = canvas.Canvas(filepath)
+            c.drawString(100, 800, f"Contrato Jurídico - Área: {user['area']}")
+            c.drawString(100, 780, f"Caso: {user['caso']}")
+            c.drawString(100, 760, f"Tem comprovante: {user['tem_comprovante']}")
+            c.drawString(100, 740, f"Meio de comprovação: {user['meio']}")
+            c.drawString(100, 720, f"Veracidade: {user['veracidade']}")
+            c.drawString(100, 700, f"Assinado virtualmente em: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+            c.drawString(100, 680, f"Advogado responsável: {ADVOGADO_NOME}")
+            c.save()
 
-    elif user["step"] == "confirmacao":
-        if incoming_msg == "sim":
-            salvar_em_banco(user, from_number)
-            gerar_contrato(user, from_number)
-            enviar_email(user)
-            msg.body(f"✅ Contrato gerado e enviado para {user['email']}!\n📞 Entre em contato com {ADVOGADO_NOME} no número {ADVOGADO_CONTATO} para prosseguir.\n\nSe quiser reiniciar, digite 'reiniciar'.")
-            session_data.pop(from_number)
+            url = f"{request.url_root}contratos/{filename}"
+            user['step'] = 7
+            users[sender] = user
+            resp.message(f"✅ Contrato gerado com sucesso! Acesse aqui:\n{url}")
+            resp.message(f"Entre em contato com o advogado para dar continuidade: {ADVOGADO_NUMERO}")
         else:
-            msg.body("❌ Cancelado. Se quiser começar de novo, digite 'reiniciar'.")
-            session_data.pop(from_number)
+            resp.message("Ok, processo encerrado. Se quiser reiniciar, digite 'início'.")
+            users[sender] = {'step': 0}
+
     else:
-        msg.body("Não entendi. Para iniciar, envie qualquer mensagem ou 'oi'.")
+        resp.message("Digite 'início' para começar uma nova conversa.")
+        users[sender] = {'step': 0}
 
-    session_data[from_number] = user
-    return str(response)
+    return str(resp)
 
-# ======= Funções auxiliares ========
-
-def salvar_em_banco(data, telefone):
-    conn = sqlite3.connect('clientes.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS clientes (
-                    telefone TEXT, area TEXT, descricao TEXT,
-                    comprovacao TEXT, meio TEXT, veridico TEXT, email TEXT
-                )''')
-    c.execute("INSERT INTO clientes VALUES (?, ?, ?, ?, ?, ?, ?)", (
-        telefone,
-        data["area"],
-        data["descricao"],
-        data["tem_comprovacao"],
-        data["como_comprova"],
-        data["veridico"],
-        data["email"]
-    ))
-    conn.commit()
-    conn.close()
-
-def gerar_contrato(data, telefone):
-    nome_pdf = f"contrato_{telefone}.pdf"
-    c = canvas.Canvas(nome_pdf)
-    c.drawString(100, 800, "Contrato de Atendimento Jurídico")
-    c.drawString(100, 770, f"Área: {data['area']}")
-    c.drawString(100, 750, f"Descrição do Caso: {data['descricao']}")
-    c.drawString(100, 730, f"Comprovação: {data['tem_comprovacao']} - {data['como_comprova']}")
-    c.drawString(100, 710, f"Informações verídicas: {data['veridico']}")
-    c.drawString(100, 690, f"E-mail: {data['email']}")
-    c.drawString(100, 670, f"Advogado Responsável: {ADVOGADO_NOME}")
-    c.save()
-
-def enviar_email(data):
-    nome_pdf = f"contrato_{data['email'].replace('@', '_')}.pdf"
-    gerar_contrato(data, data['email'].replace('@', '_'))
-
-    msg = EmailMessage()
-    msg['Subject'] = 'Contrato Jurídico'
-    msg['From'] = EMAIL_REMETENTE
-    msg['To'] = data['email']
-    msg.set_content("Segue o contrato referente ao seu atendimento jurídico.")
-
-    with open(f"contrato_{data['email'].replace('@', '_')}.pdf", 'rb') as f:
-        msg.add_attachment(f.read(), maintype='application', subtype='pdf', filename=f.name)
-
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(EMAIL_REMETENTE, SENHA_EMAIL)
-        smtp.send_message(msg)
-
-# ======= Execução =========
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(debug=True, port=5000, host='0.0.0.0')
